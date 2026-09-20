@@ -1,9 +1,14 @@
 from models.battery import Battery
 from strategies.base import Action, ActionType
+from models.validation import finite
 
 
 class ThresholdStrategy:
     def __init__(self, buy_below: float = 0.08, sell_above: float = 0.20) -> None:
+        finite("seuil d'achat", buy_below)
+        finite("seuil de vente", sell_above)
+        if buy_below >= sell_above:
+            raise ValueError("Le seuil d'achat doit être inférieur au seuil de vente")
         self.buy_below = buy_below
         self.sell_above = sell_above
 

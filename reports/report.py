@@ -1,103 +1,97 @@
+import csv
+import io
+import json
+from collections import deque
 from pathlib import Path
 
-import matplotlib.pyplot as plt
-
 from models.company import Company
-from models.transaction import TransactionType
 from simulation.engine import SimulationResult
 
 
-def print_summary(
-    company: Company,
-    result: SimulationResult,
-    simulation_days: float,
-) -> None:
-    net = company.net_profit()
-    roi = (net / result.initial_capital_chf * 100) if result.initial_capital_chf else 0.0
-
-    avg_storage_cost = (
-        company.total_energy_cost / company.total_energy_sold_kwh
-        if company.total_energy_sold_kwh > 0
-        else 0.0
-    )
-
-    print("BATTERY COMPANY SIMULATION")
-    print()
-    print(f"Simulation duration: {simulation_days:.0f} days")
-    print()
-    print(f"Initial capital:        {result.initial_capital_chf:,.0f} CHF")
-    print(f"Final cash:             {company.cash_chf:,.0f} CHF")
-    print()
-    print(f"Battery purchase:       {company.battery_purchase_cost:,.0f} CHF")
-    print(f"Energy purchased:       {company.total_energy_purchased_kwh:,.1f} kWh")
-    print(f"Energy sold:            {company.total_energy_sold_kwh:,.1f} kWh")
-    print()
-    print(f"Energy cost:            {company.total_energy_cost:,.2f} CHF")
-    print(f"Energy revenue:         {company.total_revenue:,.2f} CHF")
-    print(f"Net profit:             {net:,.2f} CHF")
-    print()
-    print(f"ROI:                    {roi:.2f} %")
-    print(f"Avg storage cost:       {avg_storage_cost:.4f} CHF/kWh (sold)")
-    print()
-
-    for battery in company.batteries:
-        initial_soh = result.initial_soh.get(battery.id, battery.state_of_health) * 100
-        battery_profit = _battery_arbitrage_profit(company, battery.id)
-        print("Battery:", battery.id)
-        print(f"  Initial SoH:            {initial_soh:.1f} %")
-        print(f"  Final SoH:              {battery.state_of_health * 100:.2f} %")
-        print(f"  Equivalent cycles:      {battery.equivalent_cycles():.2f}")
-        print(f"  Arbitrage margin:       {battery_profit:,.2f} CHF")
-        print()
+def print_summary(company: Company, result: SimulationResult, simulation_days: float | None = None) -> None:
+    from ui.console import build_final_report, console
+    console.print(build_final_report(company, result))
 
 
-def _battery_arbitrage_profit(company: Company, battery_id: str) -> float:
-    revenue = sum(
-        t.total_chf
-        for t in company.transactions
-        if t.battery_id == battery_id and t.transaction_type == TransactionType.SELL_ENERGY
-    )
-    cost = sum(
-        t.total_chf
-        for t in company.transactions
-        if t.battery_id == battery_id and t.transaction_type == TransactionType.BUY_ENERGY
-    )
-    return revenue - cost
+def export_results(company: Company, result: SimulationResult, output_dir: Path | str) -> None:
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    summary = {
+        "simulated_days": result.simulated_days,
+        "timestep_h": result.duration_h,
+        "initial_capital_chf": result.initial_capital_chf,
+        "final_cash_chf": company.cash_chf,
+        "battery_investment_chf": company.battery_purchase_cost,
+        "energy_cost_chf": company.total_energy_cost,
+        "energy_revenue_chf": company.total_revenue,
+        "maintenance_chf": company.maintenance_cost,
+        "trading_margin_chf": company.trading_pnl(),
+        "cash_result_after_investment_chf": company.net_profit(),
+        "purchased_kwh": result.purchased_kwh,
+        "sold_kwh": result.sold_kwh,
+        "initial_soc_kwh": sum(result.initial_soc_kwh.values()),
+        "final_soc_kwh": result.soc_kwh[-1],
+        "conversion_losses_kwh": result.conversion_losses_kwh,
+        "degradation_losses_kwh": result.degradation_losses_kwh,
+        "energy_balance_error_kwh": result.energy_balance_error_kwh,
+        "observed_round_trip_efficiency": result.round_trip_efficiency,
+        "batteries": [{"id": b.id, "soh": b.state_of_health, "soc_kwh": b.state_of_charge_kwh,
+                       "nominal_equivalent_cycles": b.equivalent_cycles()} for b in company.batteries],
+    }
+    (output / "summary.json").write_text(json.dumps(summary, indent=2, allow_nan=False), encoding="utf-8")
+    with (output / "transactions.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["timestamp", "type", "battery_id", "energy_kwh", "price_chf_kwh", "total_chf"])
+        for tx in company.transactions:
+            # Prefix user-controlled spreadsheet formulas while preserving ordinary IDs.
+            identifier = tx.battery_id or ""
+            if identifier.lstrip().startswith(("=", "+", "-", "@")):
+                identifier = "'" + identifier
+            writer.writerow([tx.timestamp.isoformat(), tx.transaction_type.value, identifier,
+                             tx.energy_kwh, tx.price_chf_kwh, tx.total_chf])
+    with (output / "steps.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["timestamp", "duration_h", "price_chf_kwh", "soc_kwh", "cash_chf", "trading_margin_chf"])
+        for step, soc in zip(result.steps, result.soc_kwh):
+            writer.writerow([step.timestamp.isoformat(), step.duration_h, step.price_chf_kwh,
+                             soc, step.cash_chf, step.trading_pnl_chf])
+
+
+def save_html_report(company: Company, result: SimulationResult, path: Path | str) -> None:
+    from rich.console import Console
+    from rich.terminal_theme import MONOKAI
+    from ui.console import build_dashboard, build_final_report
+    output = Console(record=True, width=115, file=io.StringIO())
+    recent = deque(maxlen=5)
+    for step in result.steps:
+        recent.extendleft(step.transactions)
+    output.print(build_dashboard(result.steps[-1], recent, width=115))
+    output.print(build_final_report(company, result))
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    output.save_html(str(destination), theme=MONOKAI)
 
 
 def save_plots(result: SimulationResult, output_dir: Path | str = "reports/output") -> None:
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    ts = result.timestamps
-
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(ts, result.prices_chf_kwh, color="tab:blue", linewidth=0.8)
-    ax.set_title("Electricity price")
-    ax.set_ylabel("CHF/kWh")
-    ax.set_xlabel("Time")
-    fig.autofmt_xdate()
-    fig.tight_layout()
-    fig.savefig(output_dir / "price.png", dpi=120)
-    plt.close(fig)
-
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(ts, result.soc_kwh, color="tab:green", linewidth=0.8)
-    ax.set_title("State of charge (total)")
-    ax.set_ylabel("kWh")
-    ax.set_xlabel("Time")
-    fig.autofmt_xdate()
-    fig.tight_layout()
-    fig.savefig(output_dir / "soc.png", dpi=120)
-    plt.close(fig)
-
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(ts, result.cumulative_profit_chf, color="tab:orange", linewidth=0.8)
-    ax.set_title("Cumulative net profit")
-    ax.set_ylabel("CHF")
-    ax.set_xlabel("Time")
-    ax.axhline(0, color="gray", linewidth=0.5, linestyle="--")
-    fig.autofmt_xdate()
-    fig.tight_layout()
-    fig.savefig(output_dir / "cumulative_profit.png", dpi=120)
-    plt.close(fig)
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    charts = [
+        ("price", result.prices_chf_kwh, "Prix de l’électricité", "CHF/kWh", "#22d3ee"),
+        ("soc", result.soc_kwh, "Énergie stockée dans le parc", "kWh", "#34d399"),
+        ("cumulative_profit", result.cumulative_profit_chf, "Solde après investissement", "CHF", "#c084fc"),
+    ]
+    with plt.style.context("dark_background"):
+        for name, values, title, unit, color in charts:
+            fig, ax = plt.subplots(figsize=(11, 4))
+            fig.patch.set_facecolor("#111827")
+            ax.set_facecolor("#111827")
+            ax.plot(result.timestamps, values, color=color, linewidth=1.2)
+            ax.set(title=title, ylabel=unit, xlabel="Date")
+            ax.grid(alpha=0.15)
+            fig.autofmt_xdate()
+            fig.tight_layout()
+            fig.savefig(output / f"{name}.png", dpi=140)
+            plt.close(fig)

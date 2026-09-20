@@ -3,6 +3,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from models.validation import finite
 
 
 def generate_hourly_prices(
@@ -11,6 +12,8 @@ def generate_hourly_prices(
     seed: int = 42,
 ) -> pd.DataFrame:
     """Synthetic hourly prices: low at night, peak in evening, with bounded noise."""
+    if not isinstance(days, int) or isinstance(days, bool) or days <= 0:
+        raise ValueError("Le nombre de jours doit être un entier positif")
     if start is None:
         start = datetime(2026, 1, 1, 0, 0, 0)
 
@@ -35,11 +38,11 @@ def generate_hourly_prices(
 
 
 def load_prices(path: Path | str) -> pd.DataFrame:
-    df = pd.read_csv(path, parse_dates=["timestamp"])
+    df = pd.read_csv(path)
     required = {"timestamp", "price_chf_kwh"}
     if not required.issubset(df.columns):
         raise ValueError(f"CSV must contain columns: {required}")
-    return df.sort_values("timestamp").reset_index(drop=True)
+    return df
 
 
 def save_prices(df: pd.DataFrame, path: Path | str) -> None:
@@ -49,8 +52,35 @@ def save_prices(df: pd.DataFrame, path: Path | str) -> None:
 
 
 class EnergyMarket:
-    def __init__(self, prices: pd.DataFrame) -> None:
-        self.prices = prices.reset_index(drop=True)
+    def __init__(self, prices: pd.DataFrame, duration_h: float | None = None) -> None:
+        if not {"timestamp", "price_chf_kwh"}.issubset(prices.columns):
+            raise ValueError("Colonnes requises : timestamp, price_chf_kwh")
+        if prices.empty:
+            raise ValueError("Le marché ne contient aucun prix")
+        frame = prices.copy().reset_index(drop=True)
+        try:
+            frame["timestamp"] = pd.to_datetime(frame["timestamp"], errors="raise")
+            frame["price_chf_kwh"] = pd.to_numeric(frame["price_chf_kwh"], errors="raise")
+        except (ValueError, TypeError) as exc:
+            raise ValueError("Dates ou prix invalides dans le marché") from exc
+        dates = frame["timestamp"]
+        if dates.isna().any() or dates.duplicated().any() or not dates.is_monotonic_increasing:
+            raise ValueError("Les dates doivent être valides, uniques et croissantes")
+        for value in frame["price_chf_kwh"]:
+            finite("prix", float(value))  # Negative prices are valid market observations.
+        if duration_h is not None:
+            finite("durée du pas", duration_h, positive=True)
+        if len(frame) > 1:
+            intervals = dates.diff().iloc[1:]
+            if not (intervals == intervals.iloc[0]).all():
+                raise ValueError("Cadence irrégulière : données manquantes ou intervalles différents")
+            inferred = intervals.iloc[0].total_seconds() / 3600
+            if duration_h is not None and not np.isclose(inferred, duration_h, rtol=0, atol=1e-9):
+                raise ValueError("La durée demandée ne correspond pas aux horodatages")
+            duration_h = inferred
+        self.duration_h = 1.0 if duration_h is None else duration_h
+        finite("durée du pas", self.duration_h, positive=True)
+        self.prices = frame
 
     @classmethod
     def from_csv(cls, path: Path | str) -> "EnergyMarket":

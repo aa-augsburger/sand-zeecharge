@@ -1,20 +1,19 @@
 from dataclasses import dataclass
 
-# SoH loss per kWh cycled relative to one full nominal cycle (1.0 = 100% SoH lost per full cycle)
-DEFAULT_DEGRADATION_FACTOR = 0.000_05
+from models.validation import finite
+
+# SoH loss per nominal equivalent full cycle (charge + discharge).
+DEFAULT_DEGRADATION_FACTOR = 0.00005
 
 
-def apply_degradation(
-    state_of_health: float,
-    energy_cycled_kwh: float,
-    nominal_capacity_kwh: float,
-    degradation_factor: float = DEFAULT_DEGRADATION_FACTOR,
-) -> float:
-    """Reduce SoH based on energy throughput. Replace this function for richer models."""
-    if energy_cycled_kwh <= 0 or nominal_capacity_kwh <= 0:
-        return state_of_health
-    loss = (energy_cycled_kwh / nominal_capacity_kwh) * degradation_factor
-    return max(0.0, state_of_health - loss)
+def apply_degradation(state_of_health: float, energy_cycled_kwh: float,
+                      nominal_capacity_kwh: float,
+                      degradation_factor: float = DEFAULT_DEGRADATION_FACTOR) -> float:
+    finite("SOH", state_of_health, 0, 1)
+    finite("énergie cyclée", energy_cycled_kwh, 0)
+    finite("capacité nominale", nominal_capacity_kwh, positive=True)
+    finite("dégradation", degradation_factor, 0, 1)
+    return max(0.0, state_of_health - energy_cycled_kwh / (2 * nominal_capacity_kwh) * degradation_factor)
 
 
 @dataclass
@@ -28,79 +27,66 @@ class Battery:
     charge_efficiency: float
     discharge_efficiency: float
     purchase_price_chf: float
-    cycles: float = 0.0
     total_energy_charged_kwh: float = 0.0
     total_energy_discharged_kwh: float = 0.0
     degradation_factor: float = DEFAULT_DEGRADATION_FACTOR
+    degradation_losses_kwh: float = 0.0
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        if not isinstance(self.id, str) or not self.id.strip():
+            raise ValueError("Identifiant de batterie vide")
+        finite("capacité nominale", self.nominal_capacity_kwh, positive=True)
+        finite("SOH", self.state_of_health, 0, 1)
+        finite("SOC", self.state_of_charge_kwh, 0, self.usable_capacity_kwh)
+        for name in ("max_charge_kw", "max_discharge_kw", "purchase_price_chf",
+                     "total_energy_charged_kwh", "total_energy_discharged_kwh", "degradation_losses_kwh"):
+            finite(name, getattr(self, name), 0)
+        for name in ("charge_efficiency", "discharge_efficiency"):
+            finite(name, getattr(self, name), maximum=1, positive=True)
+        finite("dégradation", self.degradation_factor, 0, 1)
 
     @property
     def usable_capacity_kwh(self) -> float:
         return self.nominal_capacity_kwh * self.state_of_health
 
-    def _clamp_soc(self) -> None:
-        cap = self.usable_capacity_kwh
-        self.state_of_charge_kwh = max(0.0, min(self.state_of_charge_kwh, cap))
-
-    def _record_cycle_contribution(self, energy_kwh: float) -> None:
-        cap = self.usable_capacity_kwh
-        if cap > 0:
-            self.cycles += energy_kwh / (2.0 * cap)
-
-    def charge(self, grid_kwh: float, duration_h: float = 1.0) -> float:
-        """Draw grid_kwh from the grid (limited by power and headroom). Returns actual grid kWh used."""
-        if grid_kwh <= 0:
-            return 0.0
-
-        max_energy = self.max_charge_kw * duration_h
-        headroom = self.usable_capacity_kwh - self.state_of_charge_kwh
-        max_storable = headroom / self.charge_efficiency if self.charge_efficiency > 0 else 0.0
-
-        actual_grid = min(grid_kwh, max_energy, max_storable)
-        if actual_grid <= 0:
-            return 0.0
-
-        stored = actual_grid * self.charge_efficiency
-        self.state_of_charge_kwh += stored
-        self._clamp_soc()
-
-        self.total_energy_charged_kwh += stored
-        self._record_cycle_contribution(stored)
-        self.state_of_health = apply_degradation(
-            self.state_of_health,
-            stored,
-            self.nominal_capacity_kwh,
-            self.degradation_factor,
-        )
-        self._clamp_soc()
-        return actual_grid
-
-    def discharge(self, request_battery_kwh: float, duration_h: float = 1.0) -> float:
-        """Remove energy from the battery (limited by power and SOC). Returns kWh delivered to the grid."""
-        if request_battery_kwh <= 0:
-            return 0.0
-
-        max_energy = self.max_discharge_kw * duration_h
-        from_battery = min(request_battery_kwh, max_energy, self.state_of_charge_kwh)
-        if from_battery <= 0:
-            return 0.0
-
-        to_grid = from_battery * self.discharge_efficiency
-        self.state_of_charge_kwh -= from_battery
-        self._clamp_soc()
-
-        self.total_energy_discharged_kwh += from_battery
-        self._record_cycle_contribution(from_battery)
-        self.state_of_health = apply_degradation(
-            self.state_of_health,
-            from_battery,
-            self.nominal_capacity_kwh,
-            self.degradation_factor,
-        )
-        self._clamp_soc()
-        return to_grid
+    @property
+    def cycles(self) -> float:
+        return self.equivalent_cycles()
 
     def equivalent_cycles(self) -> float:
-        cap = self.usable_capacity_kwh
-        if cap <= 0:
-            return 0.0
-        return self.total_energy_discharged_kwh / (2.0 * cap)
+        """Throughput EFC, referenced to fixed nominal capacity, never current SoH."""
+        return (self.total_energy_charged_kwh + self.total_energy_discharged_kwh) / (2 * self.nominal_capacity_kwh)
+
+    def _degrade(self, energy: float) -> None:
+        self.state_of_health = apply_degradation(
+            self.state_of_health, energy, self.nominal_capacity_kwh, self.degradation_factor)
+        lost = max(0.0, self.state_of_charge_kwh - self.usable_capacity_kwh)
+        self.degradation_losses_kwh += lost
+        self.state_of_charge_kwh = min(self.state_of_charge_kwh, self.usable_capacity_kwh)
+
+    def charge(self, grid_kwh: float, duration_h: float = 1.0) -> float:
+        """Charge power is measured on the grid side; return grid energy purchased."""
+        self.validate()
+        finite("énergie demandée", grid_kwh, 0)
+        finite("durée", duration_h, positive=True)
+        actual = min(grid_kwh, self.max_charge_kw * duration_h,
+                     (self.usable_capacity_kwh - self.state_of_charge_kwh) / self.charge_efficiency)
+        stored = actual * self.charge_efficiency
+        self.state_of_charge_kwh += stored
+        self.total_energy_charged_kwh += stored
+        self._degrade(stored)
+        return actual
+
+    def discharge(self, request_battery_kwh: float, duration_h: float = 1.0) -> float:
+        """Discharge power is measured inside the battery; return energy sold to grid."""
+        self.validate()
+        finite("énergie demandée", request_battery_kwh, 0)
+        finite("durée", duration_h, positive=True)
+        removed = min(request_battery_kwh, self.max_discharge_kw * duration_h, self.state_of_charge_kwh)
+        self.state_of_charge_kwh -= removed
+        self.total_energy_discharged_kwh += removed
+        self._degrade(removed)
+        return removed * self.discharge_efficiency
